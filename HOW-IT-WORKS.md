@@ -120,7 +120,9 @@ It also:
 
 ### `devbox__task_run`
 
-Runs an OpenCode ACP session inside an existing worktree and returns the final text.
+Runs an ACP session, then **delivers** the work: commits anything left,
+pushes the branch, opens a draft PR if none exists, and verifies the remote
+head. Returns the final text plus a `delivery` block.
 
 | Argument | Required | Meaning |
 |---|---|---|
@@ -140,11 +142,34 @@ Returns:
   "models": ["opencode/beam-free", "…"],
   "text": "…",
   "usage": { "inputTokens": 3717, "outputTokens": 9 },
+  "delivery": {
+    "ok": true,
+    "branch": "feature/42-guest-view",
+    "committed": true,
+    "commit": "…",
+    "local_head": "…",
+    "remote_head": "…",
+    "pushed": true,
+    "pr": { "number": 2, "url": "…", "state": "OPEN", "isDraft": true },
+    "error": null
+  },
   "error": null
 }
 ```
 
 Blocking. ACP may retry a failing free model several times before giving up. Read `models` if you need a different one.
+
+### `devbox__task_deliver`
+
+Commits any pending changes, pushes the branch, opens a draft PR if none exists,
+and verifies the remote head. Use it to retry delivery after a failed
+`task_run`, or when work was left uncommitted.
+
+```json
+{ "id": "42" }
+```
+
+Returns the same `delivery` object shown above.
 
 ### `devbox__task_status`
 
@@ -212,7 +237,7 @@ devbox__task_run({
 })
 ```
 
-The tool starts `opencode acp` inside the container and passes `/work/tasks/42` as the ACP `session/new` cwd. It returns when the agent finishes, with the final text, stop reason, token usage and the model list.
+The tool starts `opencode acp` inside the container and passes `/work/tasks/42` as the ACP `session/new` cwd. It returns when the agent finishes, with the final text, stop reason, token usage, the model list and a `delivery` block.
 
 ### Step 4 — the prompt
 
@@ -228,7 +253,7 @@ Definition of done:
 Rules:
 - commit the spec together with your first code commit (it is already committed)
 - do not touch main, do not force-push
-- push the branch and open a PR against main
+- do not push or open a PR; the runner delivers the branch and PR
 - never commit secrets
 
 Report back: branch, commit SHA, files changed, commands run, pass/fail.
@@ -238,12 +263,14 @@ Keep the prompt short. The spec is in the worktree; do not paste it twice.
 
 ### Step 5 — verify
 
-Do not trust the agent's report. Check:
+Do not trust the agent's report. Check the `delivery` block from `task_run`:
 
-- `devbox__task_status` — branch and head
-- GitHub MCP — branch exists, PR open, CI status
-- the spec file is on the branch
-- the PR base is `main`
+- `delivery.ok: true`
+- `delivery.pushed: true`
+- `delivery.local_head == delivery.remote_head`
+- `delivery.pr` has a number and URL
+
+Then confirm through the GitHub MCP: PR open, base `main`, CI status.
 
 ### Step 6 — close the story
 
@@ -423,8 +450,9 @@ docker exec openclaw-gateway /home/node/.config/devbox-ssh opencode acp
 ## 14. Current wiring status
 
 - `minyanmate-dev`: running, healthy.
-- `devbox` MCP: registered, probe OK; tools `task_new`, `task_run`, `task_done`, `task_list`, `task_status`.
-- `task_run`: working end-to-end (`end_turn`, `ACP_OK`).
+- `devbox` MCP: registered, probe OK; tools `task_new`, `task_run`, `task_deliver`, `task_done`, `task_list`, `task_status`.
+- `task_run`: working end-to-end; delivery is deterministic (commit, push, PR, remote-head check).
+- `task_deliver`: retries delivery without re-running the model.
 - acpx: installed at `2026.10.1`, enabled, `acp` config set, SSH wrapper in place.
 - **OpenClaw 2026.10.1 does not expose ACP as a `sessions_spawn` runtime** (the enum only allows `subagent`), and acpx 2026.10.7 requires a newer OpenClaw. That is why `task_run` drives ACP directly. The transport is still ACP over stdio; only the client owner differs.
 - If OpenClaw is later updated, `sessions_spawn(runtime:"acp")` can replace `task_run` without changing the worktree, spec or graph parts.

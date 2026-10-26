@@ -3,9 +3,13 @@
 // Runs inside minyanmate-dev; OpenClaw reaches it over SSH stdio.
 // stdout is JSON-RPC only. All logging goes to stderr.
 
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
 import readline from "node:readline";
+
+const execFileP = promisify(execFile);
 
 const DEV_TASK = "/opt/devbox/bin/dev-task";
 const TASKS = "/work/tasks";
@@ -47,9 +51,10 @@ const tools = [
   {
     name: "task_run",
     description:
-      "Run an OpenCode ACP session inside an existing story worktree and return the " +
-      "final assistant text. Blocking; up to 14 minutes. Use task_status afterwards " +
-      "to confirm the branch state.",
+      "Run an OpenCode ACP session inside an existing story worktree. After the " +
+      "model finishes, the runner commits any remaining changes, pushes the branch, " +
+      "opens a draft PR if none exists, and verifies the remote head. Blocking; " +
+      "up to 14 minutes. Returns delivery details.",
     inputSchema: {
       type: "object",
       properties: {
@@ -59,6 +64,19 @@ const tools = [
         timeout_seconds: { type: "number", description: "Wall clock limit (default 840, max 840)." },
       },
       required: ["id", "task"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "task_deliver",
+    description:
+      "Commit any pending changes in the worktree, push the branch, open a draft PR " +
+      "if none exists, and verify the remote head matches. Use this to retry delivery " +
+      "after a failed task_run, or to deliver work that was left uncommitted.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string", description: "Story id." } },
+      required: ["id"],
       additionalProperties: false,
     },
   },
@@ -134,6 +152,199 @@ function runDevTask(args, stdinText) {
     if (stdinText !== undefined) child.stdin.end(stdinText);
     else child.stdin.end();
   });
+}
+
+// --- deterministic delivery -------------------------------------------------
+
+async function runCmd(cmd, args, cwd, timeout = 120000) {
+  try {
+    const { stdout, stderr } = await execFileP(cmd, args, {
+      cwd,
+      timeout,
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, HOME: "/home/node" },
+    });
+    return { ok: true, stdout: (stdout || "").trim(), stderr: (stderr || "").trim() };
+  } catch (e) {
+    return {
+      ok: false,
+      stdout: (e.stdout || "").trim(),
+      stderr: (e.stderr || e.message || "").trim(),
+    };
+  }
+}
+
+function repoFromRemote(url) {
+  const m = String(url || "").match(/github\.com[:/]([^/]+)\/(.+?)(?:\.git)?$/);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
+function findSpec(cwd, id) {
+  try {
+    const f = readdirSync(path.join(cwd, "features")).find(
+      (n) => n.startsWith(`${id}-`) && n.endsWith(".md")
+    );
+    return f ? `features/${f}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function specTitle(cwd, id) {
+  const spec = findSpec(cwd, id);
+  if (!spec) return `story ${id}`;
+  try {
+    const first = readFileSync(path.join(cwd, spec), "utf8").split("\n")[0].trim();
+    const m = first.match(/^#\s*(?:Feature\s*\d+\s*[:\u2014-]\s*)?(.+)$/i);
+    return (m ? m[1] : `story ${id}`).trim().slice(0, 100);
+  } catch {
+    return `story ${id}`;
+  }
+}
+
+async function deliverWork(id, cwd) {
+  const out = {
+    ok: false,
+    branch: null,
+    committed: false,
+    commit: null,
+    local_head: null,
+    remote_head: null,
+    pushed: false,
+    pr: null,
+    error: null,
+  };
+  const git = (args) => runCmd("git", args, cwd);
+  const gh = (args) => runCmd("gh", args, cwd);
+
+  const fetch = await git(["fetch", "origin", "--prune", "--quiet"]);
+  if (!fetch.ok) {
+    out.error = `git fetch failed: ${fetch.stderr}`;
+    return out;
+  }
+
+  const branchRes = await git(["rev-parse", "--abbrev-ref", "HEAD"]);
+  if (!branchRes.ok) {
+    out.error = "cannot read the current branch";
+    return out;
+  }
+  out.branch = branchRes.stdout;
+  if (out.branch === "main" || out.branch === "HEAD") {
+    out.error = "refusing to deliver from main";
+    return out;
+  }
+
+  const status = await git(["status", "--porcelain"]);
+  if (status.ok && status.stdout) {
+    const add = await git(["add", "-A"]);
+    if (!add.ok) {
+      out.error = `git add failed: ${add.stderr}`;
+      return out;
+    }
+    const msg = `feat(${id}): ${specTitle(cwd, id)}`.slice(0, 120);
+    const commit = await runCmd(
+      "git",
+      [
+        "-c", "user.name=BenMordi",
+        "-c", "user.email=dev@minyanmate.local",
+        "commit", "-m", msg,
+      ],
+      cwd
+    );
+    if (!commit.ok) {
+      const recheck = await git(["status", "--porcelain"]);
+      if (recheck.ok && recheck.stdout) {
+        out.error = `git commit failed: ${commit.stderr}`;
+        return out;
+      }
+    } else {
+      out.committed = true;
+    }
+  }
+
+  const head = await git(["rev-parse", "HEAD"]);
+  out.local_head = head.stdout;
+  out.commit = head.stdout;
+
+  const changed = await git(["diff", "--name-only", "origin/main...HEAD"]);
+  const files = (changed.stdout || "").split("\n").filter(Boolean);
+  if (files.length === 0) {
+    out.error = "no changes to deliver";
+    return out;
+  }
+  if (files.every((f) => f.startsWith("features/"))) {
+    out.error = "no changes beyond the feature spec";
+    return out;
+  }
+
+  const push = await git(["push", "-u", "origin", out.branch]);
+  if (!push.ok) {
+    out.error = `git push failed: ${push.stderr}`;
+    return out;
+  }
+  out.pushed = true;
+
+  const ls = await git(["ls-remote", "origin", `refs/heads/${out.branch}`]);
+  out.remote_head = (ls.stdout || "").split(/\s+/)[0] || null;
+  if (out.remote_head !== out.local_head) {
+    out.error = `remote head ${out.remote_head || "(missing)"} != local ${out.local_head}`;
+    return out;
+  }
+
+  const remoteUrl = await git(["remote", "get-url", "origin"]);
+  const repo = repoFromRemote(remoteUrl.stdout);
+  if (!repo) {
+    out.error = "cannot derive the GitHub repo from origin";
+    return out;
+  }
+
+  const list = await gh([
+    "pr", "list", "--repo", repo, "--head", out.branch,
+    "--state", "open", "--json", "number,url,state,isDraft,title",
+  ]);
+  if (!list.ok) {
+    out.error = `gh pr list failed: ${list.stderr}`;
+    return out;
+  }
+  let prs = [];
+  try {
+    prs = JSON.parse(list.stdout || "[]");
+  } catch {
+    prs = [];
+  }
+
+  if (prs.length > 0) {
+    out.pr = prs[0];
+  } else {
+    const body =
+      `Implements ${findSpec(cwd, id) || `story ${id}`}.\n\n` +
+      `Automated delivery from the devbox runner.`;
+    const create = await gh([
+      "pr", "create", "--draft", "--repo", repo, "--base", "main",
+      "--head", out.branch, "--title", specTitle(cwd, id), "--body", body,
+    ]);
+    if (!create.ok) {
+      out.error = `gh pr create failed: ${create.stderr}`;
+      return out;
+    }
+    const view = await gh([
+      "pr", "view", out.branch, "--repo", repo,
+      "--json", "number,url,state,isDraft,title",
+    ]);
+    if (!view.ok) {
+      out.error = `PR created but view failed: ${view.stderr}`;
+      return out;
+    }
+    try {
+      out.pr = JSON.parse(view.stdout);
+    } catch {
+      out.error = "PR created but unparseable";
+      return out;
+    }
+  }
+
+  out.ok = true;
+  return out;
 }
 
 // --- ACP client: drive `opencode acp` inside the worktree -------------------
@@ -370,11 +581,38 @@ async function callTool(name, args) {
         model,
         timeoutSeconds: args.timeout_seconds,
       });
+      let delivery = null;
+      if (result.ok) {
+        delivery = await deliverWork(id, cwd);
+        result.delivery = delivery;
+        if (!delivery.ok) {
+          result.ok = false;
+          result.error = `delivery failed: ${delivery.error}`;
+        }
+      }
       console.error(
         `[devbox] task_run ${id}: ${result.ok ? "ok" : "failed"} ` +
-          `(${result.stop_reason || result.error})`
+          `(${result.stop_reason || result.error})` +
+          (delivery ? ` delivery=${delivery.ok ? "ok" : "failed"}` : "")
       );
       return { code: result.ok ? 0 : 1, stdout: JSON.stringify(result, null, 2), stderr: "" };
+    }
+    case "task_deliver": {
+      const id = str(args.id);
+      const cwd = `${TASKS}/${id}`;
+      if (!existsSync(cwd)) {
+        return { code: 2, stdout: "", stderr: `no worktree at ${cwd}` };
+      }
+      const delivery = await deliverWork(id, cwd);
+      console.error(
+        `[devbox] task_deliver ${id}: ${delivery.ok ? "ok" : "failed"} ` +
+          `(${delivery.error || "pushed"})`
+      );
+      return {
+        code: delivery.ok ? 0 : 1,
+        stdout: JSON.stringify(delivery, null, 2),
+        stderr: "",
+      };
     }
     case "task_done": {
       const argv = ["done", "--id", str(args.id)];

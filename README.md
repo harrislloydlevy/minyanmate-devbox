@@ -144,6 +144,12 @@ OpenCode Go is used for its **free tier**. `task_run` defaults to a free model
 on every run and returns `free` plus `free_models`. A paid model is only used
 when the caller passes `model` explicitly.
 
+## Delivery
+
+`task_run` commits any remaining changes, pushes the branch, opens a draft PR,
+and verifies the remote head. `task_deliver` retries that without re-running
+the model.
+
 ## Security
 
 - The repository is public. It contains paths and container names, **never**
