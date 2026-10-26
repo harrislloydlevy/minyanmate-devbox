@@ -161,10 +161,17 @@ No arguments. Lists every worktree attached to the base clone.
 ### `devbox__task_done`
 
 ```json
-{ "id": "42", "force": false }
+{ "id": "42", "remove": false, "archive": false, "force": false }
 ```
 
-Removes the worktree. Refuses if there are uncommitted changes. **Keeps the branch** — delete it after the PR merges.
+Marks the worktree done and **keeps it** at `/work/tasks/42`. The branch and all
+files stay; `task_status` and `task_list` report `done: true`.
+
+- `remove: true` — delete the worktree (explicit cleanup only).
+- `archive: true` — move it to `/work/archive/42`.
+- `force: true` — proceed even with uncommitted changes.
+
+The branch is the durable artifact on GitHub. The worktree is a local checkout.
 
 ---
 
@@ -238,15 +245,17 @@ Do not trust the agent's report. Check:
 - the spec file is on the branch
 - the PR base is `main`
 
-### Step 6 — clean up
+### Step 6 — close the story
 
 After the PR merges:
 
-```json
+```
 devbox__task_done({ "id": "42" })
 ```
 
-Then delete the branch (operator or `gh api`). Never force-remove a worktree with uncommitted work.
+This marks the worktree done and **keeps it**. Do not delete worktrees as routine
+cleanup; the branch is on GitHub, the worktree is a local reference. Use
+`remove: true` only on explicit instruction or disk pressure.
 
 ---
 
@@ -282,6 +291,11 @@ opencode.json
 ## 6. Git worktrees — why
 
 A worktree is a second working directory attached to the same `.git`. It shares objects, refs, credentials, hooks and the pnpm store; it has its own files, index, branch, `node_modules` and `graphify-out`.
+
+Worktrees are **local checkouts**. GitHub stores the branch and commits, not the
+directory. To get old work on another machine, create a worktree from the branch
+(`git worktree add <path> <branch>`). `node_modules`, `.env` and `graphify-out`
+are never in GitHub.
 
 - `main` stays checked out in `/work/minyanmate` and is never worked in.
 - Each story gets `/work/tasks/<id>` on `feature/<id>-<slug>`.

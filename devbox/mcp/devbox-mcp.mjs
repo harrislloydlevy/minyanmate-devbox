@@ -65,13 +65,17 @@ const tools = [
   {
     name: "task_done",
     description:
-      "Remove a story worktree after its PR has merged. Refuses if the worktree has " +
-      "uncommitted changes unless force is true. Keeps the branch.",
+      "Mark a story worktree done and KEEP it by default. The branch and all files " +
+      "stay under /work/tasks/<id>. Set remove=true to delete the worktree, or " +
+      "archive=true to move it to /work/archive/<id>. Refuses a dirty worktree " +
+      "unless force is true.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string", description: "Story id." },
-        force: { type: "boolean", description: "Remove even with uncommitted changes." },
+        remove: { type: "boolean", description: "Delete the worktree instead of keeping it." },
+        archive: { type: "boolean", description: "Move the worktree to /work/archive/<id>." },
+        force: { type: "boolean", description: "Proceed even with uncommitted changes." },
       },
       required: ["id"],
       additionalProperties: false,
@@ -374,6 +378,8 @@ async function callTool(name, args) {
     }
     case "task_done": {
       const argv = ["done", "--id", str(args.id)];
+      if (args.remove === true) argv.push("--remove");
+      if (args.archive === true) argv.push("--archive");
       if (args.force === true) argv.push("--force");
       return runDevTask(argv);
     }

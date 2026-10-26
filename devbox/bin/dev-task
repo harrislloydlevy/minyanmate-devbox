@@ -30,7 +30,7 @@ ensure_excludes() {
   # Generated, agent-local files must not show up as untracked in every worktree.
   local ex="$BASE/.git/info/exclude"
   mkdir -p "$(dirname "$ex")"
-  for pat in graphify-out/ .opencode/ AGENTS.md opencode.json; do
+  for pat in graphify-out/ .opencode/ AGENTS.md opencode.json .devbox-done.json; do
     grep -qxF "$pat" "$ex" 2>/dev/null || printf '%s\n' "$pat" >> "$ex"
   done
 }
@@ -39,7 +39,7 @@ usage() {
   cat >&2 <<'EOF'
 usage:
   dev-task new --id <id> --slug <slug> --title <title> [--base <ref>] [--model <p/m>] [--no-graph] [--force] < spec.md
-  dev-task done --id <id> [--force]
+  dev-task done --id <id> [--remove | --archive] [--force]
   dev-task list
   dev-task status --id <id>
 EOF
@@ -90,9 +90,13 @@ cmd_new() {
 
   local reused=0
   if [ -d "$path" ]; then
-    if [ -n "$(git -C "$path" status --porcelain)" ] && [ "$force" -ne 1 ]; then
+    if [ "$(git -C "$path" status --porcelain)" != "" ] && [ "$force" -ne 1 ]; then
       die "worktree $path exists and is dirty; use --force or finish the story"
     fi
+    if [ -f "$path/.devbox-done.json" ] && [ "$force" -ne 1 ]; then
+      die "worktree $path is marked done; use a new story id or --force to reopen"
+    fi
+    if [ "$force" -eq 1 ]; then rm -f "$path/.devbox-done.json"; fi
     local existing_branch
     existing_branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     [ "$existing_branch" = "$branch" ] || die "worktree $path is on $existing_branch, expected $branch"
@@ -214,56 +218,85 @@ JSON
 }
 
 cmd_done() {
-  local id="" force=0
+  local id="" force=0 remove=0 archive=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --id) id="${2:-}"; shift 2 ;;
       --force) force=1; shift ;;
+      --remove) remove=1; shift ;;
+      --archive) archive=1; shift ;;
       *) die "unknown argument: $1" ;;
     esac
   done
   [ -n "$id" ] || die "--id is required"
   local path="$TASKS/$id"
   [ -d "$path" ] || die "no worktree at $path"
+  [ "$remove" -eq 1 ] && [ "$archive" -eq 1 ] && die "choose --remove or --archive, not both"
 
   exec 9>"$LOCK"
   flock -w 60 9 || die "timed out waiting for the dev-task lock"
 
-  if [ -n "$(git -C "$path" status --porcelain)" ] && [ "$force" -ne 1 ]; then
+  local branch head dirty
+  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  head="$(git -C "$path" rev-parse HEAD 2>/dev/null || echo unknown)"
+  dirty="$(git -C "$path" status --porcelain | wc -l | tr -d ' ')"
+
+  if [ "$dirty" != "0" ] && [ "$force" -ne 1 ]; then
     die "worktree has uncommitted changes; commit, push, then retry (or --force)"
   fi
 
-  local branch
-  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-
-  if [ "$force" -eq 1 ]; then
-    git -C "$BASE" worktree remove --force "$path" >&2 || die "worktree remove failed"
-  else
-    git -C "$BASE" worktree remove "$path" >&2 || die "worktree remove failed"
+  if [ "$remove" -eq 1 ]; then
+    if [ "$force" -eq 1 ]; then
+      git -C "$BASE" worktree remove --force "$path" >&2 || die "worktree remove failed"
+    else
+      git -C "$BASE" worktree remove "$path" >&2 || die "worktree remove failed"
+    fi
+    git -C "$BASE" worktree prune >&2 || true
+    ok_json --arg path "$path" --arg branch "$branch" \
+      '{ok:true, removed:$path, branch:$branch, note:"branch kept"}'
+    return
   fi
-  git -C "$BASE" worktree prune >&2 || true
 
-  ok_json --arg path "$path" --arg branch "$branch" \
-    '{ok:true, removed:$path, branch:$branch, note:"branch kept; delete it after the PR merges"}'
+  if [ "$archive" -eq 1 ]; then
+    mkdir -p /work/archive
+    local target="/work/archive/$id"
+    [ -e "$target" ] && die "archive target already exists: $target"
+    git -C "$BASE" worktree move "$path" "$target" >&2 || die "worktree move failed"
+    path="$target"
+  fi
+
+  jq -n --arg at "$(date -Iseconds)" --arg branch "$branch" --arg head "$head" \
+    --argjson dirty "$dirty" \
+    '{done_at:$at, branch:$branch, head:$head, dirty_files:$dirty}' \
+    > "$path/.devbox-done.json"
+
+  ok_json --arg path "$path" --arg branch "$branch" --arg head "$head" \
+    --argjson dirty "$dirty" --argjson archived "$archive" \
+    '{ok:true, kept:$path, branch:$branch, head:$head, dirty_files:$dirty,
+      archived:($archived==1), note:"marked done; worktree kept"}'
 }
 
 cmd_list() {
-  local rows
-  rows="$(git -C "$BASE" worktree list --porcelain | awk '
-    BEGIN { printf "[" }
-    /^worktree / { if (path != "") printf ","; path=substr($0,10); head=""; branch=""; next }
-    /^HEAD / { head=substr($0,6); next }
-    /^branch / { branch=substr($0,8); next }
-    /^$/ {
-      if (path != "") printf "{\"path\":\"%s\",\"head\":\"%s\",\"branch\":\"%s\"}", path, head, branch;
-      path=""
-      next
-    }
-    END {
-      if (path != "") printf "{\"path\":\"%s\",\"head\":\"%s\",\"branch\":\"%s\"}", path, head, branch;
-      printf "]"
-    }')"
-  ok_json --argjson worktrees "$rows" '{ok:true, worktrees:$worktrees}'
+  python3 - "$BASE" <<'PY'
+import json, os, subprocess, sys
+base = sys.argv[1]
+raw = subprocess.check_output(["git", "-C", base, "worktree", "list", "--porcelain"], text=True)
+items, cur = [], {}
+for line in raw.splitlines():
+    if line.startswith("worktree "):
+        cur = {"path": line[len("worktree "):]}
+    elif line.startswith("HEAD "):
+        cur["head"] = line[len("HEAD "):]
+    elif line.startswith("branch "):
+        cur["branch"] = line[len("branch "):]
+    elif line == "" and cur:
+        cur["done"] = os.path.exists(os.path.join(cur["path"], ".devbox-done.json"))
+        items.append(cur); cur = {}
+if cur:
+    cur["done"] = os.path.exists(os.path.join(cur["path"], ".devbox-done.json"))
+    items.append(cur)
+print(json.dumps({"ok": True, "worktrees": items}))
+PY
 }
 
 cmd_status() {
@@ -277,16 +310,22 @@ cmd_status() {
   [ -n "$id" ] || die "--id is required"
   local path="$TASKS/$id"
   [ -d "$path" ] || die "no worktree at $path"
-  local branch head dirty spec graph
+  local branch head dirty spec graph done done_at
   branch="$(git -C "$path" rev-parse --abbrev-ref HEAD)"
   head="$(git -C "$path" rev-parse HEAD)"
   dirty="$(git -C "$path" status --porcelain | wc -l | tr -d ' ')"
   spec="$(ls "$path"/features/"$id"-*.md 2>/dev/null | head -1 || true)"
   graph=0; [ -f "$path/graphify-out/graph.json" ] && graph=1
+  done=0; done_at=""
+  if [ -f "$path/.devbox-done.json" ]; then
+    done=1
+    done_at="$(jq -r '.done_at // ""' "$path/.devbox-done.json" 2>/dev/null || echo "")"
+  fi
   ok_json --arg path "$path" --arg branch "$branch" --arg head "$head" \
     --arg spec "$spec" --argjson dirty "$dirty" --argjson graph "$graph" \
+    --argjson done "$done" --arg done_at "$done_at" \
     '{ok:true, path:$path, branch:$branch, head:$head, dirty_files:$dirty,
-      spec:($spec|select(.!="")), graph:($graph==1)}'
+      spec:($spec|select(.!="")), graph:($graph==1), done:($done==1), done_at:$done_at}'
 }
 
 case "${1:-}" in
