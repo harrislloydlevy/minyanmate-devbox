@@ -1,0 +1,22 @@
+Port 2222
+ListenAddress 0.0.0.0
+AddressFamily inet
+
+HostKey /etc/ssh/dev/hostkeys/ssh_host_ed25519_key
+PidFile /run/sshd.pid
+
+AuthorizedKeysFile /home/node/.ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+AllowUsers node
+UsePAM no
+X11Forwarding no
+AllowTcpForwarding no
+PermitTunnel no
+ClientAliveInterval 60
+ClientAliveCountMax 3
+MaxSessions 20
+LogLevel VERBOSE
+Subsystem sftp internal-sftp

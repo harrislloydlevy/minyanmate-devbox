@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# dev-task — workspace lifecycle for the MinyanMate devbox.
+# Creates one worktree + branch per story, seeds local state, writes the spec,
+# installs deps and (optionally) builds the code graph.
+set -euo pipefail
+
+BASE=/work/minyanmate
+TASKS=/work/tasks
+TEMPLATES=/opt/devbox/templates
+LOCK=/work/.dev-task.lock
+DEFAULT_BASE=origin/main
+DEFAULT_MODEL=""
+GIT_NAME=BenMordi
+GIT_EMAIL=dev@minyanmate.local
+
+log() { printf '[dev-task] %s\n' "$*" >&2; }
+
+die() {
+  jq -n --arg e "$*" '{ok:false,error:$e}'
+  exit 1
+}
+
+ok_json() { jq -n "$@"; }
+
+sanitize_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//'
+}
+
+ensure_excludes() {
+  # Generated, agent-local files must not show up as untracked in every worktree.
+  local ex="$BASE/.git/info/exclude"
+  mkdir -p "$(dirname "$ex")"
+  for pat in graphify-out/ .opencode/ AGENTS.md opencode.json; do
+    grep -qxF "$pat" "$ex" 2>/dev/null || printf '%s\n' "$pat" >> "$ex"
+  done
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  dev-task new --id <id> --slug <slug> --title <title> [--base <ref>] [--model <p/m>] [--no-graph] [--force] < spec.md
+  dev-task done --id <id> [--force]
+  dev-task list
+  dev-task status --id <id>
+EOF
+  exit 2
+}
+
+cmd_new() {
+  local id="" slug="" title="" base="$DEFAULT_BASE" model="$DEFAULT_MODEL" graph=1 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) id="${2:-}"; shift 2 ;;
+      --slug) slug="${2:-}"; shift 2 ;;
+      --title) title="${2:-}"; shift 2 ;;
+      --base) base="${2:-}"; shift 2 ;;
+      --model) model="${2:-}"; shift 2 ;;
+      --no-graph) graph=0; shift ;;
+      --force) force=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$id" ] || die "--id is required"
+  [ -n "$slug" ] || die "--slug is required"
+  [ -n "$title" ] || die "--title is required"
+  [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid id"
+  slug="$(sanitize_slug "$slug")"
+  [ -n "$slug" ] || die "slug is empty after sanitising"
+
+  local spec
+  spec="$(cat)"
+  [ -n "$spec" ] || die "spec markdown is required on stdin"
+
+  [ -d "$BASE/.git" ] || die "base repo missing at $BASE"
+
+  mkdir -p "$TASKS"
+  exec 9>"$LOCK"
+  flock -w 120 9 || die "timed out waiting for the dev-task lock"
+
+  ensure_excludes
+
+  local branch="feature/${id}-${slug}"
+  local path="$TASKS/$id"
+
+  log "fetching origin"
+  git -C "$BASE" fetch origin --prune --quiet || die "git fetch failed"
+
+  local base_sha
+  base_sha="$(git -C "$BASE" rev-parse "$base^{commit}")" || die "base ref not found: $base"
+
+  local reused=0
+  if [ -d "$path" ]; then
+    if [ -n "$(git -C "$path" status --porcelain)" ] && [ "$force" -ne 1 ]; then
+      die "worktree $path exists and is dirty; use --force or finish the story"
+    fi
+    local existing_branch
+    existing_branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    [ "$existing_branch" = "$branch" ] || die "worktree $path is on $existing_branch, expected $branch"
+    reused=1
+    log "reusing existing worktree $path"
+  else
+    if git -C "$BASE" show-ref --verify --quiet "refs/heads/$branch"; then
+      log "attaching existing branch $branch"
+      git -C "$BASE" worktree add "$path" "$branch" >&2 || die "git worktree add failed"
+    else
+      log "creating branch $branch from $base"
+      git -C "$BASE" worktree add "$path" -b "$branch" "$base" >&2 || die "git worktree add failed"
+    fi
+  fi
+
+  # --- seed local, gitignored state -------------------------------------
+  if [ -f "$BASE/.env" ] && [ ! -f "$path/.env" ]; then
+    cp "$BASE/.env" "$path/.env"
+    log "seeded .env"
+  fi
+  mkdir -p "$path/data"
+  if [ -f "$BASE/data/dev.db" ] && [ ! -f "$path/data/dev.db" ]; then
+    cp "$BASE/data/dev.db" "$path/data/dev.db"
+    log "seeded data/dev.db"
+  fi
+  if [ -d "$BASE/.opencode" ] && [ ! -d "$path/.opencode" ]; then
+    cp -a "$BASE/.opencode" "$path/.opencode"
+    log "seeded .opencode"
+  fi
+  if [ ! -f "$path/AGENTS.md" ] && [ -f "$BASE/AGENTS.md" ]; then
+    cp "$BASE/AGENTS.md" "$path/AGENTS.md"
+    log "seeded AGENTS.md"
+  fi
+  touch "$path/AGENTS.md"
+  if ! grep -q 'minyanmate-dev:feature-specs' "$path/AGENTS.md"; then
+    cat "$TEMPLATES/AGENTS.feature-specs.md" >> "$path/AGENTS.md"
+    log "appended feature-spec rules to AGENTS.md"
+  fi
+
+  if [ -n "$model" ]; then
+    if [ -f "$path/opencode.json" ]; then
+      jq --arg m "$model" '.model = $m' "$path/opencode.json" > "$path/.opencode.json.tmp" \
+        && mv "$path/.opencode.json.tmp" "$path/opencode.json"
+    else
+      cat > "$path/opencode.json" <<JSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "model": "$model",
+  "permissions": [{ "action": "*", "resource": "*", "effect": "allow" }]
+}
+JSON
+    fi
+  elif [ ! -f "$path/opencode.json" ]; then
+    cat > "$path/opencode.json" <<'JSON'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permissions": [{ "action": "*", "resource": "*", "effect": "allow" }]
+}
+JSON
+  fi
+
+  # --- feature spec -----------------------------------------------------
+  mkdir -p "$path/features"
+  local spec_rel="features/${id}-${slug}.md"
+  if [ -f "$path/$spec_rel" ] && [ "$force" -ne 1 ] && [ "$reused" -eq 1 ]; then
+    log "spec already exists; leaving it untouched (use --force to replace)"
+  else
+    printf '%s\n' "$spec" > "$path/$spec_rel"
+    log "wrote $spec_rel"
+  fi
+
+  if ! grep -q '^## Acceptance Criteria' "$path/$spec_rel"; then
+    log "WARN: spec has no '## Acceptance Criteria' heading"
+  fi
+
+  git -C "$path" add "$spec_rel"
+  if ! git -C "$path" diff --cached --quiet; then
+    git -C "$path" -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" \
+      commit -m "docs(${id}): add feature spec" --quiet
+    log "committed the spec"
+  fi
+
+  # --- dependencies -----------------------------------------------------
+  local deps_ok=1
+  if [ -f "$path/package.json" ] && [ ! -d "$path/node_modules" ]; then
+    log "installing dependencies (this can take a minute)"
+    if ! ( cd "$path" && pnpm install --frozen-lockfile --prefer-offline ) >&2; then
+      log "WARN: pnpm install --frozen-lockfile failed; retrying without frozen"
+      ( cd "$path" && pnpm install --prefer-offline ) >&2 || deps_ok=0
+    fi
+  fi
+
+  # --- graph ------------------------------------------------------------
+  local graph_ok=1
+  if [ "$graph" -eq 1 ]; then
+    if command -v graphify >/dev/null 2>&1; then
+      log "building the code graph (AST only)"
+      ( cd "$path" && graphify extract . --code-only ) >&2 || graph_ok=0
+    else
+      graph_ok=0
+      log "WARN: graphify not on PATH"
+    fi
+  fi
+
+  ok_json \
+    --arg path "$path" \
+    --arg branch "$branch" \
+    --arg base_ref "$base" \
+    --arg base_sha "$base_sha" \
+    --arg spec_path "$spec_rel" \
+    --arg model "$model" \
+    --argjson reused "$reused" \
+    --argjson deps_ok "$deps_ok" \
+    --argjson graph "$graph" \
+    --argjson graph_ok "$graph_ok" \
+    '{ok:true, path:$path, branch:$branch, base_ref:$base_ref, base_sha:$base_sha,
+      spec_path:$spec_path, model:$model, reused:($reused==1), deps_ok:($deps_ok==1),
+      graph:($graph==1), graph_ok:($graph_ok==1)}'
+}
+
+cmd_done() {
+  local id="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) id="${2:-}"; shift 2 ;;
+      --force) force=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$id" ] || die "--id is required"
+  local path="$TASKS/$id"
+  [ -d "$path" ] || die "no worktree at $path"
+
+  exec 9>"$LOCK"
+  flock -w 60 9 || die "timed out waiting for the dev-task lock"
+
+  if [ -n "$(git -C "$path" status --porcelain)" ] && [ "$force" -ne 1 ]; then
+    die "worktree has uncommitted changes; commit, push, then retry (or --force)"
+  fi
+
+  local branch
+  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+
+  if [ "$force" -eq 1 ]; then
+    git -C "$BASE" worktree remove --force "$path" >&2 || die "worktree remove failed"
+  else
+    git -C "$BASE" worktree remove "$path" >&2 || die "worktree remove failed"
+  fi
+  git -C "$BASE" worktree prune >&2 || true
+
+  ok_json --arg path "$path" --arg branch "$branch" \
+    '{ok:true, removed:$path, branch:$branch, note:"branch kept; delete it after the PR merges"}'
+}
+
+cmd_list() {
+  local rows
+  rows="$(git -C "$BASE" worktree list --porcelain | awk '
+    BEGIN { printf "[" }
+    /^worktree / { if (path != "") printf ","; path=substr($0,10); head=""; branch=""; next }
+    /^HEAD / { head=substr($0,6); next }
+    /^branch / { branch=substr($0,8); next }
+    /^$/ {
+      if (path != "") printf "{\"path\":\"%s\",\"head\":\"%s\",\"branch\":\"%s\"}", path, head, branch;
+      path=""
+      next
+    }
+    END {
+      if (path != "") printf "{\"path\":\"%s\",\"head\":\"%s\",\"branch\":\"%s\"}", path, head, branch;
+      printf "]"
+    }')"
+  ok_json --argjson worktrees "$rows" '{ok:true, worktrees:$worktrees}'
+}
+
+cmd_status() {
+  local id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) id="${2:-}"; shift 2 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$id" ] || die "--id is required"
+  local path="$TASKS/$id"
+  [ -d "$path" ] || die "no worktree at $path"
+  local branch head dirty spec graph
+  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD)"
+  head="$(git -C "$path" rev-parse HEAD)"
+  dirty="$(git -C "$path" status --porcelain | wc -l | tr -d ' ')"
+  spec="$(ls "$path"/features/"$id"-*.md 2>/dev/null | head -1 || true)"
+  graph=0; [ -f "$path/graphify-out/graph.json" ] && graph=1
+  ok_json --arg path "$path" --arg branch "$branch" --arg head "$head" \
+    --arg spec "$spec" --argjson dirty "$dirty" --argjson graph "$graph" \
+    '{ok:true, path:$path, branch:$branch, head:$head, dirty_files:$dirty,
+      spec:($spec|select(.!="")), graph:($graph==1)}'
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  done) shift; cmd_done "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  *) usage ;;
+esac
