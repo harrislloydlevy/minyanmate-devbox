@@ -9,7 +9,7 @@ TASKS=/work/tasks
 TEMPLATES=/opt/devbox/templates
 LOCK=/work/.dev-task.lock
 DEFAULT_BASE=origin/main
-DEFAULT_MODEL=""
+DEFAULT_MODEL=opencode-go/iceman-contributor-free
 GIT_NAME=BenMordi
 GIT_EMAIL=dev@minyanmate.local
 

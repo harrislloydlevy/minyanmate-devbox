@@ -138,6 +138,12 @@ The SSH wrapper lives at `gateway/devbox-ssh` in this repo. Copy it to
 
 ---
 
+## Models
+
+OpenCode Go is used for its **free tier**. `task_run` defaults to a free model
+on every run and returns `free` plus `free_models`. A paid model is only used
+when the caller passes `model` explicitly.
+
 ## Security
 
 - The repository is public. It contains paths and container names, **never**

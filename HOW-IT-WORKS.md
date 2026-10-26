@@ -303,12 +303,23 @@ A worktree is a second working directory attached to the same `.git`. It shares 
 
 ## 8. Models
 
-- `task_run` returns `model` (the one actually used) and `models` (the ids you may pass).
-- The Go **paid** models return `429 GoUsageLimitError` on the monthly limit; the free tier still works.
-- Free availability changes. A dead free endpoint may retry several times, then fail with `Endpoint is unavailable`.
-- ACP does **not** honour `model` from the worktree's `opencode.json`. Pass `model` to `task_run`, using an exact value from `models`.
-- If a requested model is rejected (`model not found`), omit it and let ACP pick its default.
-- Free ids seen in practice: `opencode/beam-free`, `opencode/glm-5.3-flash-free`, `opencode/deepseek-v4.1-flash-free`, `opencode/nemotron-3-ultra-free`, `opencode-go/iceman-contributor-free`. The list is volatile.
+- **Free models are the default.** `task_run` picks a free model on every run,
+  even if the ACP session starts on a paid one. The result includes `free: true`
+  and `free_models`.
+- `task_new` writes `opencode-go/iceman-contributor-free` into the worktree's
+  `opencode.json`. `task_run` reads that and switches the session to it when the
+  session default is not free.
+- Paid models are used **only** when the caller passes `model` explicitly. They
+  return `429 GoUsageLimitError` on the monthly limit.
+- Free availability changes. A dead free endpoint may retry several times, then
+  fail with `Endpoint is unavailable`.
+- ACP does **not** honour `model` from the worktree's `opencode.json` by itself;
+  `task_run` performs the switch. If a requested model is rejected
+  (`model not found`), omit it and let the runner pick a free fallback.
+- The `models` list is the full catalog; `free_models` is the safe subset.
+- Free ids seen in practice: `opencode-go/iceman-contributor-free`,
+  `opencode/glm-5.3-flash-free`, `opencode/deepseek-v4.1-flash-free`,
+  `opencode/beam-free`, `opencode/mimo-v2.6-flash-free`.
 
 ---
 

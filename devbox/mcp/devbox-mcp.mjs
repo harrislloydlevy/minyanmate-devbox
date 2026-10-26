@@ -12,6 +12,13 @@ const TASKS = "/work/tasks";
 const SERVER = { name: "devbox", version: "1.1.0" };
 const DEFAULT_PROTOCOL = "2024-11-05";
 const MAX_RUN_MS = 14 * 60 * 1000;
+const FREE_PREFERENCE = [
+  "opencode-go/iceman-contributor-free",
+  "opencode/glm-5.3-flash-free",
+  "opencode/deepseek-v4.1-flash-free",
+  "opencode/beam-free",
+];
+const isFree = (v) => /free/i.test(v || "");
 
 const tools = [
   {
@@ -226,7 +233,9 @@ function runAcp(cwd, promptText, opts = {}) {
         session_id: sessionId,
         stop_reason: stopReason,
         model: activeModel,
+        free: isFree(activeModel),
         models: availableModels,
+        free_models: availableModels.filter(isFree),
         text: text.trim(),
         usage,
         error,
@@ -254,6 +263,45 @@ function runAcp(cwd, promptText, opts = {}) {
         availableModels = (modelOption?.options || [])
           .map((o) => (typeof o === "string" ? o : o?.value))
           .filter(Boolean);
+
+        // Free by default. Only switch when the session is on a paid model and
+        // the caller did not request a specific one.
+        let target = opts.model || null;
+        if (!target && !isFree(activeModel)) {
+          target =
+            FREE_PREFERENCE.find((v) => availableModels.includes(v)) ||
+            availableModels.find(isFree) ||
+            null;
+        }
+        if (target && target !== activeModel) {
+          try {
+            await call("session/set_config_option", {
+              sessionId,
+              configId: "model",
+              value: target,
+            });
+            activeModel = target;
+          } catch (e) {
+            console.error("[devbox] model switch failed:", e.message);
+            if (!opts.model) {
+              const fallback =
+                FREE_PREFERENCE.find((v) => availableModels.includes(v)) ||
+                availableModels.find(isFree);
+              if (fallback && fallback !== activeModel) {
+                try {
+                  await call("session/set_config_option", {
+                    sessionId,
+                    configId: "model",
+                    value: fallback,
+                  });
+                  activeModel = fallback;
+                } catch (e2) {
+                  console.error("[devbox] free fallback failed:", e2.message);
+                }
+              }
+            }
+          }
+        }
         if (opts.model) {
           try {
             await call("session/set_config_option", {
