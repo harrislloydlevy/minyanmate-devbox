@@ -138,6 +138,12 @@ The SSH wrapper lives at `gateway/devbox-ssh` in this repo. Copy it to
 
 ---
 
+## MCP docs
+
+The MCP server exposes the runbook as resources and a `help` tool. Any client
+can read `devbox://docs/how-it-works` or call `help` with `overview`,
+`workflow`, `tools`, `spec`, `models` or `all`.
+
 ## Models
 
 OpenCode Go is used for its **free tier**. `task_run` defaults to a free model

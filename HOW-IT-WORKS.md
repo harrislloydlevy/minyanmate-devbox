@@ -73,7 +73,26 @@ Worktrees:
 
 ## 3. Tools the scrum master can call
 
-All five are MCP tools from the `devbox` server (prefix `devbox__`). They run inside the container.
+All tools are MCP tools from the `devbox` server (prefix `devbox__`). They run inside the container.
+
+The same documents are exposed as MCP resources:
+`devbox://docs/readme`, `devbox://docs/how-it-works`,
+`devbox://docs/spec-template`, `devbox://docs/agents-feature-specs`.
+
+### `devbox__help`
+
+Returns the operating documentation. Call it before the other tools.
+
+```json
+{ "topic": "overview" }
+```
+
+`overview` (default) — README + tool map  
+`workflow` — full HOW-IT-WORKS.md  
+`tools` — tool reference  
+`spec` — spec template + AGENTS rules  
+`models` — free-model policy  
+`all` — everything
 
 ### `devbox__task_new`
 

@@ -16,6 +16,37 @@ const TASKS = "/work/tasks";
 const SERVER = { name: "devbox", version: "1.1.0" };
 const DEFAULT_PROTOCOL = "2024-11-05";
 const MAX_RUN_MS = 14 * 60 * 1000;
+const DOC_ROOT = "/opt/devbox-repo";
+const RESOURCES = [
+  {
+    uri: "devbox://docs/readme",
+    name: "Devbox README",
+    description: "Overview, layout, build, gateway wiring and security.",
+    mimeType: "text/markdown",
+    path: `${DOC_ROOT}/README.md`,
+  },
+  {
+    uri: "devbox://docs/how-it-works",
+    name: "Devbox runbook",
+    description: "Full workflow, tool reference, worktrees, models, troubleshooting.",
+    mimeType: "text/markdown",
+    path: `${DOC_ROOT}/HOW-IT-WORKS.md`,
+  },
+  {
+    uri: "devbox://docs/spec-template",
+    name: "Feature spec template",
+    description: "Markdown template for features/<id>-<slug>.md.",
+    mimeType: "text/markdown",
+    path: `${DOC_ROOT}/devbox/templates/spec-template.md`,
+  },
+  {
+    uri: "devbox://docs/agents-feature-specs",
+    name: "Feature-spec rules",
+    description: "AGENTS.md rules for keeping the spec current.",
+    mimeType: "text/markdown",
+    path: `${DOC_ROOT}/devbox/templates/AGENTS.feature-specs.md`,
+  },
+];
 const FREE_PREFERENCE = [
   "opencode-go/iceman-contributor-free",
   "opencode/glm-5.3-flash-free",
@@ -25,6 +56,23 @@ const FREE_PREFERENCE = [
 const isFree = (v) => /free/i.test(v || "");
 
 const tools = [
+  {
+    name: "help",
+    description:
+      "Return the devbox operating documentation. Call this before using the other " +
+      "tools. Topics: overview (default), workflow, tools, spec, models, all.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: {
+          type: "string",
+          enum: ["overview", "workflow", "tools", "spec", "models", "all"],
+          description: "Which section to return.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
   {
     name: "task_new",
     description:
@@ -152,6 +200,50 @@ function runDevTask(args, stdinText) {
     if (stdinText !== undefined) child.stdin.end(stdinText);
     else child.stdin.end();
   });
+}
+
+function readDoc(p) {
+  try {
+    return readFileSync(p, "utf8");
+  } catch {
+    return `(missing: ${p})`;
+  }
+}
+
+function helpText(topic) {
+  const parts = [];
+  if (topic === "overview" || topic === "all") {
+    parts.push(readDoc(`${DOC_ROOT}/README.md`));
+    parts.push(
+      "# Tool map\n\n" +
+        tools
+          .filter((t) => t.name !== "help")
+          .map((t) => `- \`${t.name}\`: ${t.description.split(".")[0]}.`)
+          .join("\n") +
+        "\n\nTypical flow: `task_new` -> `task_run` -> `task_status` -> `task_done`.\n" +
+        'Call `help({ "topic": "workflow" })` for the full runbook.'
+    );
+  }
+  if (topic === "workflow" || topic === "all") {
+    parts.push(readDoc(`${DOC_ROOT}/HOW-IT-WORKS.md`));
+  }
+  if (topic === "spec" || topic === "all") {
+    parts.push("# Spec template\n\n" + readDoc(`${DOC_ROOT}/devbox/templates/spec-template.md`));
+    parts.push(
+      "# Feature-spec rules\n\n" +
+        readDoc(`${DOC_ROOT}/devbox/templates/AGENTS.feature-specs.md`)
+    );
+  }
+  if (topic === "tools" || topic === "all") {
+    parts.push("# Tools\n\n" + tools.map((t) => `## ${t.name}\n\n${t.description}`).join("\n\n"));
+  }
+  if (topic === "models") {
+    parts.push(
+      "# Models\n\nOpenCode Go is used for its free tier. `task_run` defaults to a free model " +
+        "and returns `free` and `free_models`. Pass `model` only when you explicitly need a paid one."
+    );
+  }
+  return parts.filter(Boolean).join("\n\n---\n\n");
 }
 
 // --- deterministic delivery -------------------------------------------------
@@ -554,6 +646,15 @@ function runAcp(cwd, promptText, opts = {}) {
 async function callTool(name, args) {
   const str = (v) => (v === undefined || v === null ? "" : String(v));
   switch (name) {
+    case "help": {
+      const topic = str(args.topic || "overview");
+      const text = helpText(topic);
+      return {
+        code: text ? 0 : 2,
+        stdout: text || `unknown topic: ${topic}`,
+        stderr: "",
+      };
+    }
     case "task_new": {
       const argv = ["new", "--id", str(args.id), "--slug", str(args.slug), "--title", str(args.title)];
       if (args.base) argv.push("--base", str(args.base));
@@ -650,7 +751,7 @@ async function handle(msg) {
   if (method === "initialize") {
     reply(id, {
       protocolVersion: params?.protocolVersion || DEFAULT_PROTOCOL,
-      capabilities: { tools: {} },
+      capabilities: { tools: {}, resources: {} },
       serverInfo: SERVER,
     });
     return;
@@ -662,6 +763,28 @@ async function handle(msg) {
   }
   if (method === "tools/list") {
     reply(id, { tools });
+    return;
+  }
+  if (method === "resources/list") {
+    reply(id, {
+      resources: RESOURCES.map(({ path, ...r }) => r),
+    });
+    return;
+  }
+  if (method === "resources/templates/list") {
+    reply(id, { resourceTemplates: [] });
+    return;
+  }
+  if (method === "resources/read") {
+    const uri = params?.uri;
+    const r = RESOURCES.find((x) => x.uri === uri);
+    if (!r) {
+      replyError(id, -32602, `unknown resource: ${uri}`);
+      return;
+    }
+    reply(id, {
+      contents: [{ uri: r.uri, mimeType: r.mimeType, text: readDoc(r.path) }],
+    });
     return;
   }
   if (method === "tools/call") {
